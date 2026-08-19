@@ -1,0 +1,186 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-skillflow}
+      POSTGRES_USER: ${POSTGRES_USER:-skillflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-skillflow}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-skillflow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      DJANGO_DEBUG: "false"
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-dev-secret-change-me}
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,backend,api}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-skillflow}
+      POSTGRES_USER: ${POSTGRES_USER:-skillflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-skillflow}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+    ports:
+      - "8001:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - media_data:/app/media
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  celery_worker:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    command: celery -A config worker --loglevel=INFO --concurrency=2
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      DJANGO_DEBUG: "false"
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-dev-secret-change-me}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-skillflow}
+      POSTGRES_USER: ${POSTGRES_USER:-skillflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-skillflow}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      # API container already runs migrations; worker only waits for DB.
+      SKILLFLOW_RUN_MIGRATIONS: "false"
+    depends_on:
+      backend:
+        condition: service_started
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - media_data:/app/media
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q celery /proc/1/cmdline || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  celery_beat:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    command: celery -A config beat --loglevel=INFO --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      DJANGO_DEBUG: "false"
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-dev-secret-change-me}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-skillflow}
+      POSTGRES_USER: ${POSTGRES_USER:-skillflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-skillflow}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      SKILLFLOW_RUN_MIGRATIONS: "false"
+    depends_on:
+      backend:
+        condition: service_started
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q celery /proc/1/cmdline || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  frontend:
+    build:
+      context: ./frontend
+      # NEXT_PUBLIC_* vars must be passed as build args, NOT just runtime env,
+      # because `next build` inlines them as string literals into the client
+      # bundle. Without this, the bundle falls back to the dev URL even if the
+      # runtime env is correct.
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8001}
+        NEXT_PUBLIC_USE_MOCKS: ${NEXT_PUBLIC_USE_MOCKS:-false}
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8001}
+      NEXT_PUBLIC_USE_MOCKS: ${NEXT_PUBLIC_USE_MOCKS:-false}
+      NODE_ENV: production
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  mobile_web:
+    build:
+      context: ./mobile
+      dockerfile: Dockerfile.web
+      # Flutter resolves `String.fromEnvironment` / `bool.fromEnvironment` at
+      # compile time, so the API URL and mock flag MUST be passed as build
+      # args (mirrors what `frontend` does for NEXT_PUBLIC_*). Changing these
+      # values requires a rebuild — runtime env on the container is too late.
+      args:
+        API_BASE_URL: ${MOBILE_WEB_API_BASE_URL:-https://api.skillflow.peladeiro.cloud}
+        USE_MOCKS: ${MOBILE_WEB_USE_MOCKS:-false}
+    restart: unless-stopped
+    # Map host 8082 -> container 80 to avoid clashing with backend (8001) and
+    # frontend (3000). In Coolify the public hostname (mobile.<domain>) is
+    # bound to the container's port 80 by the proxy; the host port is only
+    # used for local validation.
+    ports:
+      - "8082:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  postgres_data:
+  media_data:

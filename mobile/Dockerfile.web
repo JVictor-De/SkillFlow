@@ -1,0 +1,80 @@
+# syntax=docker/dockerfile:1.6
+# =============================================================================
+# SkillFlow · Flutter Web — multi-stage Dockerfile
+#
+# Stage 1 (build):
+#   - uses the official cirruslabs Flutter image. The tag MUST satisfy the
+#     SDK constraints recorded in pubspec.lock (currently
+#     "dart: >=3.5.0 <4.0.0" and "flutter: >=3.24.0"). Bumping the lock to a
+#     newer Flutter requires bumping this tag too, otherwise `flutter pub get`
+#     fails inside the container with a Dart SDK mismatch.
+#   - scaffolds the `web/` platform folder if it is missing (the repo only
+#     ships `lib/` + `pubspec.yaml`);
+#   - bakes the production env via `--dart-define`. This is mandatory because
+#     `Env.apiBaseUrl` and `Env.useMocks` (lib/config/env.dart) are
+#     `String.fromEnvironment` / `bool.fromEnvironment` constants — they are
+#     resolved at compile time and CANNOT be changed without a rebuild.
+#
+# Stage 2 (runtime):
+#   - serves the static bundle with nginx:alpine + the vhost in nginx.conf;
+#   - exposes :80 and answers /healthz for HEALTHCHECK.
+# =============================================================================
+
+# ---------- Stage 1 · build the web bundle ---------------------------------- #
+FROM ghcr.io/cirruslabs/flutter:3.24.0 AS build
+
+WORKDIR /app
+
+# Build args propagated by docker-compose. Defaults are PRODUCTION-safe so a
+# bare `docker build` without args still produces a usable image.
+ARG API_BASE_URL=https://api.skillflow.peladeiro.cloud
+ARG USE_MOCKS=false
+
+# The cirruslabs image clones Flutter from git inside /sdks/flutter — newer
+# versions of git refuse to operate on directories owned by another user, so
+# we mark both the SDK and our project as safe.
+RUN git config --global --add safe.directory '*'
+
+# Prime the dependency cache before copying the source tree, so unrelated
+# code changes don't bust this layer.
+COPY pubspec.yaml pubspec.lock ./
+RUN flutter config --enable-web --no-analytics \
+ && flutter pub get
+
+# Now copy the rest of the project. The .dockerignore filters out
+# build/, .dart_tool/, native platform folders, tests, etc.
+COPY . .
+
+# `flutter build web` requires a `web/` directory. The repo currently only
+# targets Android/iOS, so we scaffold web on the fly. `flutter create` is
+# idempotent when the folder already exists.
+RUN if [ ! -d "web" ]; then \
+        flutter create --platforms=web --project-name=skillflow_app . ; \
+    fi \
+ && flutter pub get
+
+# Compile the production bundle. CanvasKit is the default renderer and works
+# the same as on mobile; switch to --web-renderer html only if bundle size is
+# critical and you accept slightly different text rendering.
+RUN flutter build web \
+        --release \
+        --dart-define=API_BASE_URL=${API_BASE_URL} \
+        --dart-define=USE_MOCKS=${USE_MOCKS}
+
+# ---------- Stage 2 · minimal nginx runtime --------------------------------- #
+FROM nginx:1.27-alpine AS runtime
+
+# wget ships with busybox in the base image — used for HEALTHCHECK.
+# Replace the default vhost with our SPA-aware config.
+RUN rm /etc/nginx/conf.d/default.conf
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+# Static bundle produced by stage 1.
+COPY --from=build /app/build/web/ /usr/share/nginx/html/
+
+EXPOSE 80
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD wget -q --spider http://localhost/healthz || exit 1
+
+CMD ["nginx", "-g", "daemon off;"]

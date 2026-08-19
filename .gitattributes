@@ -1,0 +1,9 @@
+# Force LF on shell scripts and Dockerfiles so Windows-side checkouts don't
+# break Linux containers at boot time.
+*.sh         text eol=lf
+Dockerfile   text eol=lf
+*.Dockerfile text eol=lf
+entrypoint.sh text eol=lf
+
+# Auto-detect text vs binary; fall back to LF in repo storage.
+* text=auto

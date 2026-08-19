@@ -1,0 +1,14 @@
+.next
+node_modules
+npm-debug.log
+.git
+.gitignore
+.env*.local
+.env
+__tests__
+.swc
+coverage
+.vscode
+.idea
+*.tsbuildinfo
+README.md
